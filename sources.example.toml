@@ -1,0 +1,43 @@
+# agent-kb config. Copy to ~/.config/agent-kb/sources.toml (or point KB_CONFIG / --config at any file).
+# Sources are opt-in: only the roots listed here are ever read.
+
+database = "kb"        # on a local PostgreSQL 18 with pgvector
+host = "127.0.0.1"
+port = 5432
+user = "kb_owner"      # created by `kb init`
+
+# Extra folder names that are never indexed, wherever they sit in a path (case-folded). Built-in and always on:
+# any `raw/` folder (and raw/interviews). A config can add names, never remove those.
+deny_dirs = ["journal"]
+
+# Score multiplier per layer, applied in every search mode (a layer not listed weighs 1.0; a name that no
+# [[source]] uses is refused at load).
+[layer_weights]
+plans = 0.9
+
+# One [[source]] per root. A root is a directory, or a single .md file (`root = "~/CLAUDE.md"`).
+[[source]]
+name = "memory"
+root = "~/.claude/projects/my-project/memory"   # an agent's memory-note folder
+layer = "memory"
+include = ["*.md"]
+exclude = ["MEMORY.md"]    # a link list matches every query
+private = true             # hits print "[private]" (a reminder for prompts, not access control)
+
+[[source]]
+name = "wiki"
+root = "~/notes"
+layer = "wiki"
+include = ["wiki/**/*.md"]
+
+[[source]]
+name = "rules"
+root = "~/CLAUDE.md"
+layer = "rules"
+
+[[source]]
+name = "plans"
+root = "~/plans"
+layer = "plans"
+include = ["**/*.md"]
+exclude = ["**/node_modules/**"]

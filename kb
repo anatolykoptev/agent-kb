@@ -1,0 +1,221 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.13,<3.15"
+# dependencies = [
+#   "psycopg[binary]==3.3.9",
+#   "onnxruntime==1.32.0",
+#   "tokenizers==0.23.3",
+#   "huggingface-hub==2.4.0",
+#   "numpy==2.5.5",
+#   "pyyaml==6.0.3",
+# ]
+# ///
+"""kb: search agent memory notes and markdown wikis by meaning (Russian + English, local embeddings + optional full-text).
+
+Local only: the one network call is the public model download (`kb fetch-model`, or once by itself when the model is missing; KB_NO_AUTOFETCH=1 disables). See README.md.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import resource
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from kbcore import config as kbconfig  # noqa: E402
+from kbcore import embed as kbembed  # noqa: E402
+from kbcore import store  # noqa: E402
+
+
+class Lazy:
+    """Embedder opened on start() or on first use. OnnxEmbedder() returns quickly (its session loads on a worker thread),
+    so start() lets the ~0.5 s model load overlap the sync walk and the DB round-trips. A missing model raises
+    ModelMissing from embed(), where the callers already handle it."""
+
+    model = kbembed.MODEL
+
+    def __init__(self):
+        self._e = None
+        self._err = None
+
+    def start(self):
+        if self._e is None and self._err is None:
+            try:
+                self._e = kbembed.OnnxEmbedder()
+            except kbembed.ModelMissing as e:
+                self._err = e
+
+    def embed(self, texts):
+        self.start()
+        if self._err:
+            raise self._err
+        return self._e.embed(texts)
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def cmd_init(args, cfg):
+    store.init(cfg)
+    print(f"database {cfg.database} ready on {cfg.host}:{cfg.port} (role {cfg.user})")
+
+
+def cmd_fetch(args, cfg):
+    print(kbembed.fetch_model())
+
+
+def cmd_sync(args, cfg):
+    os.nice(15)
+    t = time.time()
+    with store.connect(cfg) as c:
+        if args.path:
+            if args.source or args.full:
+                raise SystemExit("kb: --path cannot be combined with --source or --full")
+            emb, st = Lazy(), store.SyncStats()
+            for p in args.path:
+                for k, v in store.sync_path(cfg, c, emb, p, log=log).items():
+                    st[k] += v
+        else:
+            st = store.sync(cfg, c, Lazy(), sources=args.source.split(",") if args.source else None, full=args.full, log=log)
+    print(json.dumps(dict(st)) + f" in {time.time() - t:.1f}s")
+
+
+def resolve_mode(args) -> tuple[str, bool]:
+    """(mode name, chosen explicitly). --fts-only / --vec-only are the old spellings of --mode fts0 / vec."""
+    chosen = [m for m in (args.mode, "fts0" if args.fts_only else None, "vec" if args.vec_only else None) if m]
+    if len(chosen) > 1:
+        raise SystemExit("kb: --mode, --fts-only and --vec-only are mutually exclusive")
+    if chosen:
+        return store.resolve_mode(chosen[0]), True
+    return store.DEFAULT_MODE, False
+
+
+def cmd_search(args, cfg):
+    t0 = time.time()
+    mode, explicit = resolve_mode(args)
+    emb = Lazy()
+    if store.MODES[mode]["vec"]:
+        emb.start()  # the model loads on a worker thread while psycopg imports and the sync walk run
+    try:
+        c = store.connect(cfg)
+    except Exception as e:
+        print(f"kb: index unavailable ({type(e).__name__}); use grep", file=sys.stderr)
+        return 3
+    with c:
+        if not args.no_sync:
+            store.sync(cfg, c, emb, log=log)
+        srcs = args.source.split(",") if args.source else None
+        layers = args.layer.split(",") if args.layer else None
+        try:
+            hits = store.search(cfg, c, emb, args.query, args.k, srcs, layers, mode)
+        except kbembed.ModelMissing as e:
+            if explicit and not store.MODES[mode]["fts"]:  # asked for vector-only: no silent substitute
+                print(f"kb: {e}", file=sys.stderr)
+                return 3
+            print(f"kb: {e}; full-text only", file=sys.stderr)
+            mode = "fts1"
+            hits = store.search(cfg, c, None, args.query, args.k, srcs, layers, mode)
+        ms = int((time.time() - t0) * 1000)
+        c.execute("INSERT INTO kb.search_log (session, query, k, mode, hits, ms) VALUES (%s,%s,%s,%s,%s,%s)",
+                  (os.environ.get("KB_SESSION"), args.query, args.k, mode, len(hits), ms))
+        c.commit()
+    if args.json:
+        print(json.dumps(hits, ensure_ascii=False))
+        return 0
+    for i, h in enumerate(hits, 1):
+        flag = f" {h['flag']}" if h["flag"] else ""
+        priv = " [private]" if h["private"] else ""
+        print(f"{i}  {h['score']:.4f}  {h['source']}  {h['path']}:{h['start']}-{h['end']}  # {h['heading']}{flag}{priv}")
+        print(f"   {h['snippet']}")
+    if not hits:
+        print("no hit (not proof of absence: grep before concluding)")
+    return 0
+
+
+def cmd_status(args, cfg):
+    with store.connect(cfg) as c:
+        s = store.status(cfg, c)
+    for n, v in s["per_source"].items():
+        print(f"{n:15} files={v['files']:5} chunks={v['chunks']:6} embedded={v['embedded']:6} last_sync={v['last_sync']}")
+    print(f"model(s): {', '.join(s['models']) or 'none'}")
+    print(f"deny count: {s['deny_count']}  drift (disk vs index files): {s['drift']}")
+    if s["memory_md"]:
+        m = s["memory_md"]
+        print(f"MEMORY.md: {m['lines']} lines, {m['bytes']} bytes (cap 200 lines / 25 KB)")
+    for p in s["deny_paths"]:
+        print("DENIED PATH INDEXED:", p)
+    return 0 if s["deny_count"] == 0 else 2
+
+
+def cmd_bench(args, cfg):
+    """G0 timing gate: embed N chunks (spread over the corpus) at nice 15 with the production embedder settings; extrapolate."""
+    os.nice(15)
+    allc = []
+    nchunks = 0
+    for src in cfg.sources:
+        for f in store.scan(src):
+            _, ch = store.prepare(src, f, Path(f.abs).read_bytes())
+            nchunks += len(ch)
+            allc.extend(c["label"] + "\n" + c["body"] for c in ch)
+    step = max(1, len(allc) // args.n)
+    sample = allc[::step][: args.n]
+    t = time.time()
+    e = kbembed.OnnxEmbedder()
+    load = time.time() - t
+    therm0 = store.thermal_ok()
+    t = time.time()
+    e.embed(sample)
+    dt = time.time() - t
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+    rate = len(sample) / dt
+    chars = sum(len(x) for x in sample) / len(sample)
+    print(json.dumps({
+        "chunks_total": nchunks, "sample": len(sample), "avg_chars": round(chars), "model_load_s": round(load, 1),
+        "embed_s": round(dt, 1), "chunks_per_s": round(rate, 2), "peak_rss_mb": round(rss),
+        "projected_full_build_min": round(nchunks / rate / 60, 1), "thermal_ok_before": therm0,
+        "thermal_ok_after": store.thermal_ok(),
+    }))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="kb")
+    ap.add_argument("--config", help="config TOML (default: KB_CONFIG, else ~/.config/agent-kb/sources.toml)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="create role/database/schema (run as the cluster owner)").set_defaults(fn=cmd_init)
+    sub.add_parser("fetch-model", help="one-time public model download").set_defaults(fn=cmd_fetch)
+    p = sub.add_parser("sync")
+    p.add_argument("--source")
+    p.add_argument("--full", action="store_true")
+    p.add_argument("--path", action="append", help="sync only this file (repeatable): same scope and deny rules; "
+                   "outside every source = no-op; a deleted file leaves the index")
+    p.set_defaults(fn=cmd_sync)
+    p = sub.add_parser("search")
+    p.add_argument("query")
+    p.add_argument("-k", type=int, default=5)
+    p.add_argument("--source")
+    p.add_argument("--layer")
+    p.add_argument("--mode", choices=sorted(store.MODES) + sorted(store.ALIASES),
+                   help=f"ranker (default {store.DEFAULT_MODE}): vec = vectors only; h0 = RRF of vectors + the original russian-only full-text "
+                        "leg; h1 = RRF of vectors + dual-config AND-then-OR full-text leg; w25/w50 = full-text leg weighted 0.25/0.5 "
+                        "(h0w25, h0w50, h1w25, h1w50); fts0 / fts1 = full-text legs alone")
+    p.add_argument("--fts-only", action="store_true", help="same as --mode fts0")
+    p.add_argument("--vec-only", action="store_true", help="same as --mode vec")
+    p.add_argument("--no-sync", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_search)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("bench", help="200-chunk timing gate")
+    p.add_argument("-n", type=int, default=200)
+    p.set_defaults(fn=cmd_bench)
+    args = ap.parse_args()
+    cfg = kbconfig.load(args.config)
+    sys.exit(args.fn(args, cfg) or 0)
+
+
+if __name__ == "__main__":
+    main()
